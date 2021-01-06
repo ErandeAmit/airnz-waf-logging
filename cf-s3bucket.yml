@@ -1,0 +1,65 @@
+Description: Central S3 bucket for cross account WAF logs ingested via Kienesis Firehose
+Parameters:
+  BucketName:
+    Type: String
+    Description: Bucket name used to store the WAF logs
+  IAMRoleName:
+    Type: String
+    Description: IAM role name deployed out via StackSets to thats used by the Kinesis Firehose for WAF logging into this account
+Resources:
+  WAFLogsBucket:
+    DeletionPolicy: Retain
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      BucketName: !Ref BucketName
+      LifecycleConfiguration:
+        Rules:
+        - Id: DeleteAfter90Days
+          Status: Enabled
+          ExpirationInDays: 90
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: True
+        BlockPublicPolicy: True
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: True
+  WAFLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WAFLogsBucket
+      PolicyDocument:
+        Statement:
+          - Sid: Allow Org from specific IAM role assumed by Kinesis Firehose
+            Principal:
+              AWS: "*"
+            Action:
+              - s3:AbortMultipartUpload
+              - s3:GetBucketLocation
+              - s3:GetObject
+              - s3:ListBucket
+              - s3:ListBucketMultipartUploads
+              - s3:PutObject
+              - s3:PutObjectAcl
+            Effect: Allow
+            Resource:
+              - !Sub "arn:aws:s3:::${WAFLogsBucket}"
+              - !Sub "arn:aws:s3:::${WAFLogsBucket}/*"
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: o-fuqa77ts24
+              ArnEquals:
+                aws:PrincipalArn: !Sub "arn:aws:iam::*:role/${IAMRoleName}"
+          - Sid: AWSDDoSResponseTeamAccessS3Bucket
+            Effect: Allow
+            Principal:
+              Service: drt.shield.amazonaws.com
+            Action:
+              - s3:GetBucketLocation
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - arn:aws:s3:::${WAFLogsBucket}
+              - arn:aws:s3:::${WAFLogsBucket}/*

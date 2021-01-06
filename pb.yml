@@ -1,0 +1,151 @@
+--- # cloudformation
+- name: launch ansible cloudformation
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    # Deployment parameters
+    aws_account: airnz-coreinfrastructure-prod
+
+    lambdas:  # For Lambdas that dont fit in the CFN template (due to 4096 byte character restriction).  Otherwise the other lambdas are embedded in the CFN template
+      - name: core
+
+    # Tagging parameters
+    tags: # https://confluence.korunet.co.nz/display/DSP/AWS+Resource+Tagging+Strategy
+      airnz:bus:product: "Automation for Stacksets"
+      airnz:bus:severity: Severity3
+      airnz:bus:owner: "AWS Platform Management"
+      airnz:sec:domain: High
+      airnz:sec:classification: Sensitive
+      airnz:tech:createdby: awsplatform@airnz.co.nz  # used as CFN parameter 'SNSTopicSubscription'
+      airnz:tech:application:role: "Lambda"
+      airnz:tech:environment: prod  # used to form the CFN stack name
+      airnz:tech:name: firehose-waf-logs-stacksets  # used to form the CFN stack name
+      airnz:bitbucket:repo: https://bitbucket.airnz.co.nz/projects/CCC/repos/airnz-shield-advanced/
+
+    # Playbook parameters
+    stack_name: "{{ tags['airnz:tech:environment'] | lower }}-{{ tags['airnz:tech:name'] | lower }}"
+
+  tasks:
+  - name: Get role name
+    shell: "aws --profile {{ aws_account }} sts get-caller-identity --query Arn --output text | cut -d : -f 6 | cut -d / -f 2"
+    changed_when: False
+    register: role_name_output
+  - name: Get role ARN
+    shell: "aws --profile {{ aws_account }} iam get-role --role-name {{ role_name_output.stdout }} "
+    changed_when: False
+    register: role_output
+  - name: assume sts role
+    shell: aws sts assume-role
+      --role-arn="{{ (role_output.stdout | from_json)['Role']['Arn'] }}"
+      --role-session-name="{{ (role_output.stdout | from_json)['Role']['RoleName'] }}"
+      --profile="{{ aws_account }}"
+    changed_when: False
+    register: sts_session_output
+  - name: set sts facts
+    set_fact:
+      sts_creds:
+        AWS_DEFAULT_REGION: ap-southeast-2
+        AWS_ACCESS_KEY: "{{ (sts_session_output.stdout | from_json)['Credentials']['AccessKeyId'] }}"
+        AWS_ACCESS_KEY_ID: "{{ (sts_session_output.stdout | from_json)['Credentials']['AccessKeyId'] }}"
+        AWS_SECRET_KEY: "{{ (sts_session_output.stdout | from_json)['Credentials']['SecretAccessKey'] }}"
+        AWS_SECRET_ACCESS_KEY: "{{ (sts_session_output.stdout | from_json)['Credentials']['SecretAccessKey'] }}"
+        AWS_SECURITY_TOKEN: "{{ (sts_session_output.stdout | from_json)['Credentials']['SessionToken'] }}"
+  - block:
+    - name: PUT stacksets template to S3
+      aws_s3:
+        bucket: 337196071970-cfn-templates
+        object: "/{{stack_name}}/stackset-roles.yml"
+        src: ./templates/stackset-roles.yml
+        mode: put
+    - name: PUT stacksets template to S3
+      aws_s3:
+        bucket: 337196071970-cfn-templates
+        object: "/{{stack_name}}/stackset-regional.yml"
+        src: ./templates/stackset-regional.yml
+        mode: put
+    - name: gather facts - ansible_date_time
+      setup:
+        filter: ansible_date_time
+    - name: Safe Mode | Generate Changeset name
+      set_fact:
+        cf_changeset_name: "{{ 'CS' + ansible_date_time.iso8601_basic }}"
+    - name: Safe Mode | Deploy Cloudformation Changeset - check the console for status
+      cloudformation:
+        stack_name: "{{ stack_name }}"
+        changeset_name: "{{ cf_changeset_name }}"
+        create_changeset: yes
+        state: "present"
+        template: "cf.yml"
+        template_parameters:
+          SlackChannel: security-shield
+        tags: "{{ tags }}"
+      register: cfn_facts
+
+    - name: Safe Mode | Get details about each change
+      shell: "{{ 'aws cloudformation describe-change-set --change-set-name ' + cf_changeset_name + ' --stack-name ' + stack_name }}"
+      register: aws_cfnsget_cs_result
+      when: cfn_facts is changed
+      environment: "{{ sts_creds }}"
+
+    - name: Safe Mode | Show changeset changes
+      debug:
+        msg: |
+          The changes CloudFormation will make:
+          {{ (aws_cfnsget_cs_result.stdout | from_json)['Changes'] | to_yaml }}"
+      when: cfn_facts is changed
+
+    - name: Safe Mode | Review Template Differences and press 'C' and return to Continue or 'A' and return to abort
+      pause:
+        echo: yes
+      register: aws_cfnspause_result
+      when: cfn_facts is changed
+
+    - name: Safe Mode | Fail if aborted
+      fail:
+        msg: "Interrupted..."
+      when: aws_cfnspause_result.user_input | d('') | lower is search('a')
+
+    - name: Safe Mode | Execute Change sets
+      shell: "{{ 'aws cloudformation execute-change-set --change-set-name ' + cf_changeset_name + ' --stack-name ' + stack_name }}"
+      when: cfn_facts is changed
+      environment: "{{ sts_creds }}"
+
+    - name: Poll cloudformation until its in a steady state
+      cloudformation_facts:
+        stack_name: "{{ stack_name }}"
+      environment: "{{ sts_creds }}"
+      register: cfn_facts
+      retries: "50"
+      delay: "5"
+      until: cfn_facts['ansible_facts']['cloudformation']['{{ stack_name }}']['stack_description']['stack_status'] in ["UPDATE_COMPLETE","CREATE_COMPLETE","ROLLBACK_COMPLETE","UPDATE_ROLLBACK_COMPLETE","DELETE_COMPLETE"]
+
+    - name: Create large Lambdas dirs
+      file:
+        path: ./build/{{ item.name }}
+        state: directory
+      with_items: "{{ lambdas }}"
+
+    - name: Copy large lambdas to their respective dirs and rename files to match handler
+      copy:
+        src: "./lambdas/{{ item.name }}.py"
+        dest: ./build/{{ item.name }}/index.py
+      with_items: "{{ lambdas }}"
+
+    - name: Archive large Lambdas
+      archive:
+        path: ./build/{{ item.name }}/index.py
+        dest: './build/{{ item.name.replace("-","") }}.zip'
+        format: zip
+      with_items: "{{ lambdas }}"
+      register: archive_result
+
+    - name: Upload large lambda packages to their respective lambda function
+      shell: aws lambda update-function-code --function-name {{ cfn_facts | json_query(query) | first }} --zip-file fileb://build/{{ item.name.replace("-","") }}.zip
+      vars:
+        - query: 'ansible_facts.cloudformation."{{ stack_name }}".stack_description.outputs[?output_key==`{{ item.name.replace("-","").split(".")[0] }}`].output_value'
+      environment: "{{ sts_creds }}"
+      with_items: "{{ lambdas }}"
+      when: archive_result is changed
+
+    environment: "{{ sts_creds }}"

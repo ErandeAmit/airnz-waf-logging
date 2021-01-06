@@ -1,0 +1,705 @@
+Description: Automation for StackSets to provision Kinesis Firehose delivery streams in each AWS account within the organization.  Shield Advanced subscription and provisioning of resource protection across the organization
+Parameters:
+  SlackChannel:
+    Type: String
+    Description: Name of Slack Channel for notifications
+  SlackTokenParameterKey:
+    Type: String
+    Description: Key name of Slack Webhook
+    Default: prod-claptrap-token
+Resources:
+  StackSetCoreRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+        Version: '2012-10-17'
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+      - PolicyName:  !Sub "${AWS::StackName}-parameters-policy"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - cloudformation:*
+              Resource:
+                - !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:*"
+            - Effect: Allow
+              Action: sqs:SendMessage
+              Resource: !Sub "arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${SlackNotificationsSQSQueue.QueueName}"
+            - Effect: Allow
+              Action: iam:PassRole
+              Resource: !GetAtt StackSetAdminRole.Arn
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub "arn:aws:s3:::337196071970-cfn-templates/${AWS::StackName}/*"
+            - Effect: Allow
+              Action:
+              - dynamodb:GetItem
+              - dynamodb:Query
+              - dynamodb:Scan
+              Resource:
+                - Fn::Sub: "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/prod-core-inventory-accounts*"
+            # - Effect: Allow
+            #   Action:
+            #     - ec2:DescribeVpcEndpoints
+            #     - ec2:DescribeManagedPrefixLists
+            #     - ram:GetResourceShare*
+            #   Resource: "*"
+      RoleName: !Sub '${AWS::StackName}-lambda'
+  StackSetAdminRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service: cloudformation.amazonaws.com
+        Version: '2012-10-17'
+      Policies:
+      - PolicyName:  !Sub "${AWS::StackName}-parameters-admin-policy"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Action:
+                - cloudformation:*
+              Resource:
+                - "*"
+            - Effect: "Allow"
+              Action:
+                - sts:AssumeRole
+              Resource:
+                - !Sub "arn:aws:iam::*:role/coreinfrastructureSupport"
+      RoleName: !Sub '${AWS::StackName}-admin-role'
+  StackSetCoreLambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: StackSetAdminRole
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3
+      Description: Create a StackSet to deploy to all accounts in the organization for central WAF logging
+      Environment:
+        Variables:
+          STACK_SET_NAME_ROLES: !Sub "${AWS::StackName}"
+          STACK_SET_NAME_REGIONAL: !Sub "${AWS::StackName}-regional"
+          STACK_SET_LOG_GROUP: aws-waf-logs-central
+          STACK_SET_LOG_STREAM: error
+          STACK_SET_FIREHOSE_IAM_ROLE_NAME: aws-waf-logs-central
+          ACC_TABLE_NAME: prod-core-inventory-accounts
+          SLACK_USERNAME: !Sub "${AWS::StackName}"
+          SLACK_NOTIFICATIONS_SQS_QUEUE: !Ref SlackNotificationsSQSQueue
+          SLACK_WEBHOOK_PARAMETER: slack-apes-webhook
+          EXECUTION_ROLE_NAME: coreinfrastructureSupport
+          ADMIN_ROLE_ARN: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-admin-role'
+      FunctionName: !Sub "${AWS::StackName}-core"
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role:
+        Fn::GetAtt: StackSetCoreRole.Arn
+      Runtime: python3.7
+      Timeout: 150
+
+### Shield Advanced subscription and provisioning of resource protection
+
+  ShieldAdvancedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+        Version: '2012-10-17'
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+      - PolicyName:  !Sub "${AWS::StackName}-shield-advanced-policy"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: sqs:SendMessage
+              Resource: !Sub "arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${SlackNotificationsSQSQueue.QueueName}"
+            - Effect: Allow
+              Action:
+              - dynamodb:GetItem
+              - dynamodb:Query
+              - dynamodb:Scan
+              Resource:
+                - Fn::Sub: "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/prod-core*"
+                - Fn::Sub: "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/shared-core*"
+            - Effect: "Allow"
+              Action: sts:AssumeRole
+              Resource: !Sub "arn:aws:iam::*:role/coreinfrastructureSupport"
+      RoleName: !Sub '${AWS::StackName}-shield-advanced-lambda'
+  ShieldAdvancedLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3, os, json
+
+          def cross_account_client(service,sts_response):
+              return boto3.client(service,
+                          region_name = 'ap-southeast-2',
+                          aws_access_key_id = sts_response['Credentials']['AccessKeyId'],
+                          aws_secret_access_key = sts_response['Credentials']['SecretAccessKey'],
+                          aws_session_token = sts_response['Credentials']['SessionToken']
+                      )
+
+          def send_to_slack(message):
+              sqs = boto3.client('sqs')
+              return sqs.send_message(
+                  QueueUrl=os.environ['SLACK_NOTIFICATIONS_SQS_QUEUE'],
+                  MessageBody=json.dumps({"Channel": os.environ['SLACK_CHANNEL'], "Username": os.environ['SLACK_USERNAME'], "Message": message})
+                  )
+
+          def lambda_handler(event, context):
+              sts = boto3.client('sts')
+              session = boto3.Session()
+              dynamodb = session.resource('dynamodb')
+              acctable = dynamodb.Table(os.environ['ACC_TABLE_NAME'])
+              accresp = acctable.scan()
+
+              for acc in sorted(accresp['Items'], key=lambda acc: acc['AWSAccountAlias']):
+                  sts_response =  sts.assume_role(RoleArn=f"arn:aws:iam::{acc['AWSAccountID']}:role/{os.environ['CROSS_ACCOUNT_ROLE_NAME']}",RoleSessionName="coreinfrastructureSupport",DurationSeconds=900)
+
+                  ## Subscribe to shield advanced
+                  shield = cross_account_client('shield',sts_response)
+                  resp = shield.get_subscription_state()
+                  if resp['SubscriptionState'] == 'INACTIVE':
+                      subresp = shield.create_subscription()
+                      print(f"{acc['AWSAccountAlias']}|SUBSCRIBED")
+                      send_to_slack(f"`{acc['AWSAccountAlias']}` has been subscribed to Shield Advanced")
+
+                  # Associate DRT role:
+                  shield = cross_account_client('shield',sts_response)
+                  resp = shield.associate_drt_role(
+                      RoleArn=f"arn:aws:iam::{acc['AWSAccountID']}:role/AWSShieldDRTAccessRole")
+
+                  # Get shield subscription state
+                  # shield = cross_account_client('shield',sts_response)
+                  # resp = shield.get_subscription_state()
+                  # print(f"{acc['AWSAccountAlias']}|{resp['SubscriptionState']}")
+
+      Description: Used to subscribe accounts in the org to shield advanced and provision resource protections
+      Environment:
+        Variables:
+          ACC_TABLE_NAME: prod-core-inventory-accounts
+          SLACK_USERNAME: prod-shield-advanced-subscription
+          SLACK_CHANNEL: !Ref SlackChannel
+          SLACK_NOTIFICATIONS_SQS_QUEUE: !Ref SlackNotificationsSQSQueue
+          CROSS_ACCOUNT_ROLE_NAME: coreinfrastructureSupport
+      FunctionName: prod-shield-advanced-subscription
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role:
+        Fn::GetAtt: ShieldAdvancedRole.Arn
+      Runtime: python3.7
+      Timeout: 360
+
+  ProtectCloudfrontLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3, os, json
+
+          def paginate(method, **kwargs):
+              client = method.__self__
+              paginator = client.get_paginator(method.__name__)
+              for page in paginator.paginate(**kwargs).result_key_iters():
+                  for result in page:
+                      yield result
+
+          def cross_account_client(service,sts_response):
+              return boto3.client(service,
+                          region_name = 'ap-southeast-2',
+                          aws_access_key_id = sts_response['Credentials']['AccessKeyId'],
+                          aws_secret_access_key = sts_response['Credentials']['SecretAccessKey'],
+                          aws_session_token = sts_response['Credentials']['SessionToken']
+                      )
+
+          def send_to_slack(message):
+              sqs = boto3.client('sqs')
+              return sqs.send_message(
+                  QueueUrl=os.environ['SLACK_NOTIFICATIONS_SQS_QUEUE'],
+                  MessageBody=json.dumps({"Channel": os.environ['SLACK_CHANNEL'], "Username": os.environ['SLACK_USERNAME'], "Message": message})
+                  )
+
+          def lambda_handler(event, context):
+              sts = boto3.client('sts')
+              session = boto3.Session()
+              dynamodb = session.resource('dynamodb')
+              acctable = dynamodb.Table(os.environ['ACC_TABLE_NAME'])
+              accresp = acctable.scan()
+
+              for acc in sorted(accresp['Items'], key=lambda acc: acc['AWSAccountAlias']):
+                  sts_response =  sts.assume_role(RoleArn=f"arn:aws:iam::{acc['AWSAccountID']}:role/{os.environ['CROSS_ACCOUNT_ROLE_NAME']}",RoleSessionName="coreinfrastructureSupport",DurationSeconds=900)
+
+                  ### Create Protection on Cloudfronts
+                  shield = cross_account_client('shield',sts_response)
+                  cf = cross_account_client('cloudfront',sts_response)
+                  listdists = list(paginate(cf.list_distributions))
+                  listprots = list(paginate(shield.list_protections))
+                  for i in listdists:
+                      protected = False
+                      protected = [True for j in listprots if i['ARN'] == j['ResourceArn']]
+                      if protected:
+                          print(f"{acc['AWSAccountAlias']}|Already protected {i['ARN']}")
+                      else:
+                          resp = shield.create_protection(
+                              Name=f"cloudfront-{i['Id']}",
+                              ResourceArn=i['ARN'])
+                          print(f"{acc['AWSAccountAlias']}|Protection created for {i['ARN']}")
+                          send_to_slack(f"Protection created for `{i['ARN']}` in account `{acc['AWSAccountAlias']}`")
+      Description: Used to provision resource protections on Cloudfront across the org
+      Environment:
+        Variables:
+          ACC_TABLE_NAME: prod-core-inventory-accounts
+          SLACK_USERNAME: prod-shield-advanced-protect-cloudfront
+          SLACK_CHANNEL: !Ref SlackChannel
+          SLACK_NOTIFICATIONS_SQS_QUEUE: !Ref SlackNotificationsSQSQueue
+          CROSS_ACCOUNT_ROLE_NAME: coreinfrastructureSupport
+      FunctionName: prod-shield-advanced-protect-cloudfront
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role:
+        Fn::GetAtt: ShieldAdvancedRole.Arn
+      Runtime: python3.7
+      Timeout: 900
+
+  ProtectLoadBalancersLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3, os, json
+
+          def paginate(method, **kwargs):
+              client = method.__self__
+              paginator = client.get_paginator(method.__name__)
+              for page in paginator.paginate(**kwargs).result_key_iters():
+                  for result in page:
+                      yield result
+
+          def cross_account_client(service,sts_response):
+              return boto3.client(service,
+                          region_name = 'ap-southeast-2',
+                          aws_access_key_id = sts_response['Credentials']['AccessKeyId'],
+                          aws_secret_access_key = sts_response['Credentials']['SecretAccessKey'],
+                          aws_session_token = sts_response['Credentials']['SessionToken']
+                      )
+
+          def send_to_slack(message):
+              sqs = boto3.client('sqs')
+              return sqs.send_message(
+                  QueueUrl=os.environ['SLACK_NOTIFICATIONS_SQS_QUEUE'],
+                  MessageBody=json.dumps({"Channel": os.environ['SLACK_CHANNEL'], "Username": os.environ['SLACK_USERNAME'], "Message": message})
+                  )
+
+          def lambda_handler(event, context):
+              sts = boto3.client('sts')
+              session = boto3.Session()
+              dynamodb = session.resource('dynamodb')
+              acctable = dynamodb.Table(os.environ['ACC_TABLE_NAME'])
+              accresp = acctable.scan()
+
+              for acc in sorted(accresp['Items'], key=lambda acc: acc['AWSAccountAlias']):
+                  sts_response =  sts.assume_role(RoleArn=f"arn:aws:iam::{acc['AWSAccountID']}:role/{os.environ['CROSS_ACCOUNT_ROLE_NAME']}",RoleSessionName="coreinfrastructureSupport",DurationSeconds=900)
+
+                  ## Create Protection on internet-facing ELBs
+                  shield = cross_account_client('shield',sts_response)
+                  elb = cross_account_client('elb',sts_response)
+                  listelbs = list(paginate(elb.describe_load_balancers))
+                  listprots = list(paginate(shield.list_protections))
+                  for i in listelbs:
+                      if i['Scheme'] == 'internet-facing':
+                          protected = False
+                          elbarn = f"arn:aws:elasticloadbalancing:ap-southeast-2:{acc['AWSAccountID']}:loadbalancer/{i['LoadBalancerName']}"
+                          protected = [True for j in listprots if elbarn == j['ResourceArn']]
+                          if protected:
+                              print(f"{acc['AWSAccountAlias']}|Already protected {elbarn}")
+                          else:
+                              resp = shield.create_protection(
+                                  Name=f"elbinternet-{i['LoadBalancerName']}",
+                                  ResourceArn=elbarn)
+                              print(f"{acc['AWSAccountAlias']}|Protection created for {elbarn}")
+                              send_to_slack(f"Protection created for `{elbarn}` in account `{acc['AWSAccountAlias']}`")
+
+                  ## Create Protection on internet-facing ALBs
+                  elbv2 = cross_account_client('elbv2',sts_response)
+                  listelbs = list(paginate(elbv2.describe_load_balancers))
+                  for i in listelbs:
+                      if i['Scheme'] == 'internet-facing' and i['Type'] == 'application':
+                          protected = False
+                          protected = [True for j in listprots if i['LoadBalancerArn'] == j['ResourceArn']]
+                          if protected:
+                              print(f"{acc['AWSAccountAlias']}|Already protected {i['LoadBalancerArn']}")
+                          else:
+                              resp = shield.create_protection(
+                                  Name=f"albinternet-{i['LoadBalancerName']}",
+                                  ResourceArn=i['LoadBalancerArn'])
+                              print(f"{acc['AWSAccountAlias']}|Protection created for {i['LoadBalancerArn']}")
+                              send_to_slack(f"Protection created for `{i['LoadBalancerArn']}` in account `{acc['AWSAccountAlias']}`")
+      Description: Used to provision resource protections on internet facing ELBs and ALBs across the org
+      Environment:
+        Variables:
+          ACC_TABLE_NAME: prod-core-inventory-accounts
+          SLACK_USERNAME: prod-shield-advanced-protect-load-balancers
+          SLACK_CHANNEL: !Ref SlackChannel
+          SLACK_NOTIFICATIONS_SQS_QUEUE: !Ref SlackNotificationsSQSQueue
+          CROSS_ACCOUNT_ROLE_NAME: coreinfrastructureSupport
+      FunctionName: prod-shield-advanced-protect-load-balancers
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role:
+        Fn::GetAtt: ShieldAdvancedRole.Arn
+      Runtime: python3.7
+      Timeout: 900
+
+  ProtectHostedZonesLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3, os, json
+
+          def paginate(method, **kwargs):
+              client = method.__self__
+              paginator = client.get_paginator(method.__name__)
+              for page in paginator.paginate(**kwargs).result_key_iters():
+                  for result in page:
+                      yield result
+
+          def cross_account_client(service,sts_response):
+              return boto3.client(service,
+                          region_name = 'ap-southeast-2',
+                          aws_access_key_id = sts_response['Credentials']['AccessKeyId'],
+                          aws_secret_access_key = sts_response['Credentials']['SecretAccessKey'],
+                          aws_session_token = sts_response['Credentials']['SessionToken']
+                      )
+
+          def send_to_slack(message):
+              sqs = boto3.client('sqs')
+              return sqs.send_message(
+                  QueueUrl=os.environ['SLACK_NOTIFICATIONS_SQS_QUEUE'],
+                  MessageBody=json.dumps({"Channel": os.environ['SLACK_CHANNEL'], "Username": os.environ['SLACK_USERNAME'], "Message": message})
+                  )
+
+          def lambda_handler(event, context):
+              sts = boto3.client('sts')
+              session = boto3.Session()
+              dynamodb = session.resource('dynamodb')
+              acctable = dynamodb.Table(os.environ['ACC_TABLE_NAME'])
+              accresp = acctable.scan()
+
+              for acc in sorted(accresp['Items'], key=lambda acc: acc['AWSAccountAlias']):
+                  sts_response =  sts.assume_role(RoleArn=f"arn:aws:iam::{acc['AWSAccountID']}:role/{os.environ['CROSS_ACCOUNT_ROLE_NAME']}",RoleSessionName="coreinfrastructureSupport",DurationSeconds=900)
+
+                  ### Create Protection on Route 53 public hosted zones - Selected accounts only that have live public hosted zones
+                  if acc['AWSAccountAlias'] in ['airnz-cms-prod','airnz-dsp-prod']:
+                      shield = cross_account_client('shield',sts_response)
+                      route53 = cross_account_client('route53',sts_response)
+                      listzones = list(paginate(route53.list_hosted_zones))
+                      listprots = list(paginate(shield.list_protections))
+                      for i in sorted(listzones, key=lambda i: i['Name']):
+                          if not i['Config']['PrivateZone']:
+                              zoneid = i['Id'].split("/")[-1]
+                              zonearn = f"arn:aws:route53:::hostedzone/{zoneid}"
+                              protected = False
+                              protected = [True for j in listprots if zonearn == j['ResourceArn']]
+                              if protected:
+                                  print(f"{acc['AWSAccountAlias']}|{i['Name']}|Already protected {zonearn}")
+                              else:
+                                  resp = shield.create_protection(
+                                      Name=f"pubhostedzone-{zoneid}",
+                                      ResourceArn=zonearn)
+                                  print(f"{acc['AWSAccountAlias']}|{i['Name']}|Protection created for {zonearn}")
+                                  send_to_slack(f"Protection created for `{i['Name']}|{zonearn}` in account `{acc['AWSAccountAlias']}`")
+      Description: Used to provision resource protections on Route 53 public hosted zones across the org
+      Environment:
+        Variables:
+          ACC_TABLE_NAME: prod-core-inventory-accounts
+          SLACK_USERNAME: prod-shield-advanced-protect-hosted-zones
+          SLACK_CHANNEL: !Ref SlackChannel
+          SLACK_NOTIFICATIONS_SQS_QUEUE: !Ref SlackNotificationsSQSQueue
+          CROSS_ACCOUNT_ROLE_NAME: coreinfrastructureSupport
+      FunctionName: prod-shield-advanced-protect-hosted-zones
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role:
+        Fn::GetAtt: ShieldAdvancedRole.Arn
+      Runtime: python3.7
+      Timeout: 900
+
+### State machine related resources
+
+  ShieldAdvanecdStateMachineRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - !Sub states.${AWS::Region}.amazonaws.com
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: StatesExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource:
+                  - !GetAtt ShieldAdvancedLambdaFunction.Arn
+                  - !GetAtt ProtectCloudfrontLambdaFunction.Arn
+                  - !GetAtt ProtectLoadBalancersLambdaFunction.Arn
+                  - !GetAtt ProtectHostedZonesLambdaFunction.Arn
+                  - !GetAtt SlackNotificationsLambdaFunction.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !Sub "arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${SlackNotificationsSQSQueue.QueueName}"
+      RoleName: 'prod-shield-advanced-state-machine-role'
+
+  ShieldAdvanecdStateMachine:
+    Type: "AWS::StepFunctions::StateMachine"
+    Properties:
+      DefinitionString:
+        !Sub
+          - |-
+            {
+              "Comment": "State machine to track the org wide subscription to Shield Advanced and the provisioning of resource protection to the various public AWS services",
+              "StartAt": "Shield Advanced Subscription lambda",
+              "States": {
+                "Shield Advanced Subscription lambda": {
+                  "Type": "Task",
+                  "Resource": "${ShieldAdvancedLambdaFunction}",
+                  "Catch": [ {
+                    "ErrorEquals": ["States.TaskFailed"],
+                    "Next": "Exception Handler"
+                  } ],
+                  "Next": "Protect Cloudfront lambda"
+                },
+                "Protect Cloudfront lambda": {
+                  "Type": "Task",
+                  "Resource": "${ProtectCloudfrontLambdaFunction}",
+                  "Catch": [ {
+                    "ErrorEquals": ["States.TaskFailed"],
+                    "Next": "Exception Handler"
+                  } ],
+                  "Next": "Protect public Load Balancers lambda"
+                },
+                "Protect public Load Balancers lambda": {
+                  "Type": "Task",
+                  "Resource": "${ProtectLoadBalancersLambdaFunction}",
+                  "Catch": [ {
+                    "ErrorEquals": ["States.TaskFailed"],
+                    "Next": "Exception Handler"
+                  } ],
+                  "Next": "Protect Route 53 public hosted zones lambda"
+                },
+                "Protect Route 53 public hosted zones lambda": {
+                  "Type": "Task",
+                  "Resource": "${ProtectHostedZonesLambdaFunction}",
+                  "Catch": [ {
+                    "ErrorEquals": ["States.TaskFailed"],
+                    "Next": "Exception Handler"
+                  } ],
+                  "End": true
+
+                },
+                "Exception Handler": {
+                  "Type" : "Task",
+                  "Resource": "arn:aws:states:::sqs:sendMessage",
+                  "Parameters": {
+                    "QueueUrl": "${SlackNotificationsSQSQueue}",
+                    "MessageBody": {
+                      "Channel": "apes",
+                      "Username": "prod-shield-advanced-state-machine",
+                      "Message": "Issue with State Machine run, please check execution",
+                      "Execution.$": "$$.Execution.Id"
+                    }
+                  },
+                  "End": true
+                }
+              }
+            }
+          - {
+            ShieldAdvancedLambdaFunction: !GetAtt [ ShieldAdvancedLambdaFunction, Arn ],
+            ProtectCloudfrontLambdaFunction: !GetAtt [ ProtectCloudfrontLambdaFunction, Arn ],
+            ProtectLoadBalancersLambdaFunction: !GetAtt [ ProtectLoadBalancersLambdaFunction, Arn ],
+            ProtectHostedZonesLambdaFunction: !GetAtt [ ProtectHostedZonesLambdaFunction, Arn ],
+            SlackNotificationsSQSQueue: !Ref SlackNotificationsSQSQueue
+            }
+      RoleArn: !GetAtt ShieldAdvanecdStateMachineRole.Arn
+      StateMachineName: prod-shield-advanced-state-machine
+
+  StateMachineCloudwatchEvents:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: prod-shield-advanced-state-machine
+      ScheduleExpression: "cron(0 18 * * ? *)"
+      State: ENABLED
+      Targets:
+        - Arn: !Ref ShieldAdvanecdStateMachine
+          Id: prod-shield-advanced-state-machine
+          RoleArn: !GetAtt ShieldAdvanecdStateMachineCloudwatchEventsRole.Arn
+  ShieldAdvanecdStateMachineCloudwatchEventsRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: events.amazonaws.com
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: AllowStepFunctionExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "states:StartExecution"
+                Resource: !Ref ShieldAdvanecdStateMachine
+      RoleName: 'prod-shield-advanced-state-machine-cloudwatchevents-role'
+
+
+### New Slack Lambda for Shield Advanced (as opposed to using the apes one)
+
+  SlackNotificationsLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3, json, logging, os
+          from slackclient import SlackClient
+
+          def getParameter(param_name):
+              ssm = boto3.client('ssm')
+              response = ssm.get_parameters(
+                  Names=[
+                      param_name,
+                  ],
+                  WithDecryption=True
+              )
+              value = response['Parameters'][0]['Value']
+              return value
+
+          def lambda_handler(event, context):
+
+              print(event)
+
+              ssm = boto3.client('ssm')
+              ssmresponse = ssm.get_parameters(
+                  Names=[
+                      os.environ['SLACK_TOKEN_KEY_NAME'],
+                  ],
+                  WithDecryption=True
+              )
+
+              slack_token = ssmresponse['Parameters'][0]['Value']
+              sc = SlackClient(slack_token)
+              for i in event['Records']:
+                  print(i['body'])
+                  body = json.loads(i['body'])
+
+                  logger = logging.getLogger()
+                  logger.setLevel(logging.INFO)
+                  if body['Message'] == 'Issue with State Machine run, please check execution':
+                      body['Message'] = f"{body['Message']} ID: <https://ap-southeast-2.console.aws.amazon.com/states/home?region=ap-southeast-2#/executions/details/{body['Execution']}|{body['Execution'].split(':')[-1]}>"
+                  try:
+                      sc.api_call(
+                          "chat.postMessage",
+                          username=body['Username'],
+                          channel=body['Channel'],
+                          text=body['Message'],
+                          icon_emoji=":shield:"
+                          )
+                      logger.info("Message posted to %s", body['Channel'])
+                  except HTTPError as e:
+                      logger.error("Request failed: %d %s", e.code, e.reason)
+                  except URLError as e:
+                      logger.error("Server connection failed: %s", e.reason)
+
+      Description: Used to notify Shield Advanced related events to a slack channel
+      Environment:
+        Variables:
+          SLACK_TOKEN_KEY_NAME: !Ref SlackTokenParameterKey
+      FunctionName: prod-shield-advanced-slack-notifications
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role:
+        Fn::GetAtt: SlackNotificationsRole.Arn
+      Runtime: python3.6
+      Timeout: 10
+  SlackNotificationsSQSQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: prod-shield-advanced-slack-notifications
+      VisibilityTimeout: 10
+      MessageRetentionPeriod: 60
+      DelaySeconds: 0
+      KmsMasterKeyId: alias/aws/sqs
+  LambdaFunctionClientSQSEventSource:
+    Type: AWS::Lambda::EventSourceMapping
+    DependsOn: SlackNotificationsRole
+    Properties:
+      BatchSize: 1
+      # Enabled: true
+      EventSourceArn: !GetAtt SlackNotificationsSQSQueue.Arn
+      FunctionName: !Ref SlackNotificationsLambdaFunction
+  SlackNotificationsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+        Version: '2012-10-17'
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+      - PolicyName:  !Sub "${AWS::StackName}-allow-sqs"
+        PolicyDocument:
+          Statement:
+            - Effect: "Allow"
+              Action:
+                - sqs:SendMessage
+                - sqs:ReceiveMessage
+                - sqs:DeleteMessage
+                - sqs:GetQueueAttributes
+              Resource:
+                - !Sub "arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${SlackNotificationsSQSQueue.QueueName}"
+      - PolicyName:  !Sub "${AWS::StackName}-get-webhook-parameter-from-ssm"
+        PolicyDocument:
+          Statement:
+            - Effect: Allow
+              Action: ssm:GetParameters
+              Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${SlackTokenParameterKey}"
+      RoleName: prod-shield-advanced-slack-notifications-role
+
+
+Outputs:
+  core:
+    Value:
+      Fn::GetAtt: StackSetCoreLambdaFunction.Arn

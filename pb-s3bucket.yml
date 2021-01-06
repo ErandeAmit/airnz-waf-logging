@@ -1,0 +1,64 @@
+--- # cloudformation
+- name: launch ansible cloudformation
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    # Deployment parameters
+    aws_account: airnz-monitoring
+    bucket_name: central-waf-logging
+    iam_role_name: aws-waf-logs-central
+
+    # Tagging parameters
+    tags: # https://confluence.korunet.co.nz/display/DSP/AWS+Resource+Tagging+Strategy
+      airnz:bus:product: "WAF logs"
+      airnz:bus:severity: Severity3
+      airnz:bus:owner: "AWS Platform Management"
+      airnz:sec:domain: High
+      airnz:sec:classification: Sensitive
+      airnz:tech:createdby: awsplatform@airnz.co.nz  # used as CFN parameter 'SNSTopicSubscription'
+      airnz:tech:application:role: "S3 Bucket"
+      airnz:tech:environment: prod  # used to form the CFN stack name
+      airnz:tech:name: waf-logs-bucket  # used to form the CFN stack name
+      airnz:bitbucket:repo: https://bitbucket.airnz.co.nz/projects/CCC/repos/airnz-shield-advanced/
+
+    # Playbook parameters
+    stack_name: "{{ tags['airnz:tech:environment'] | lower }}-{{ tags['airnz:tech:name'] | lower }}"
+
+  tasks:
+  - name: Get role name
+    shell: "aws --profile {{ aws_account }} sts get-caller-identity --query Arn --output text | cut -d : -f 6 | cut -d / -f 2"
+    changed_when: False
+    register: role_name_output
+  - name: Get role ARN
+    shell: "aws --profile {{ aws_account }} iam get-role --role-name {{ role_name_output.stdout }} "
+    changed_when: False
+    register: role_output
+  - name: assume sts role
+    shell: aws sts assume-role
+      --role-arn="{{ (role_output.stdout | from_json)['Role']['Arn'] }}"
+      --role-session-name="{{ (role_output.stdout | from_json)['Role']['RoleName'] }}"
+      --profile="{{ aws_account }}"
+    changed_when: False
+    register: sts_session_output
+  - name: set sts facts
+    set_fact:
+      sts_creds:
+        AWS_DEFAULT_REGION: ap-southeast-2
+        AWS_ACCESS_KEY: "{{ (sts_session_output.stdout | from_json)['Credentials']['AccessKeyId'] }}"
+        AWS_ACCESS_KEY_ID: "{{ (sts_session_output.stdout | from_json)['Credentials']['AccessKeyId'] }}"
+        AWS_SECRET_KEY: "{{ (sts_session_output.stdout | from_json)['Credentials']['SecretAccessKey'] }}"
+        AWS_SECRET_ACCESS_KEY: "{{ (sts_session_output.stdout | from_json)['Credentials']['SecretAccessKey'] }}"
+        AWS_SECURITY_TOKEN: "{{ (sts_session_output.stdout | from_json)['Credentials']['SessionToken'] }}"
+
+  - name: Deploy Cloudformation template - check the console for status
+    cloudformation:
+      stack_name: "{{ stack_name }}"
+      state: "present"
+      template: "cf-s3bucket.yml"
+      template_parameters:
+        BucketName: "{{ bucket_name }}"
+        IAMRoleName: "{{ iam_role_name }}"
+      tags: "{{ tags }}"
+    register: CFfacts
+    environment: "{{ sts_creds }}"

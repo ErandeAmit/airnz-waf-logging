@@ -1,0 +1,245 @@
+Description: Resources for Kinesis Firehose delivery stream for central WAF logging - Managed by the AWS Platform team - Regional
+Parameters:
+  LogGroup:
+    Type: String
+    Default: aws-waf-logs-central
+  LogStream:
+    Type: String
+    Default: error
+  FirehoseIAMRoleName:
+    Type: String
+  SlackChannel:
+    Type: String
+    Default: security-shield
+  SlackNotificationsSQSQueue:
+    Type: String
+    Default: https://sqs.ap-southeast-2.amazonaws.com/337196071970/shared-core-resources-slack-notifications-V2
+  
+Resources:
+  FireHoseTransformationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: The role to be assumed by the waf firehose transformation lambda
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              Service:
+                - firehose.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: kms-inline
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:ListKeyPolicies
+                  - kms:ListRetirableGrants
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                  - kms:DescribeKey
+                  - kms:CreateGrant
+                  - kms:ListGrants
+                Resource:
+                  - arn:aws:kms:ap-southeast-2:337196071970:key/93c777f6-644b-4b35-8665-57c2b618deea
+        - PolicyName: sqs-inline
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource:
+                  - arn:aws:sqs:ap-southeast-2:337196071970:shared-core-resources-slack-notifications-V2
+        - PolicyName: firehose-inline
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - firehose:PutRecord
+                  - firehose:PutRecordBatch
+                Resource:
+                  - !Sub "arn:aws:firehose:${AWS::Region}:${AWS::AccountId}:deliverystream:/aws-waf-logs-central-test"
+        - PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                  - lambda:GetFunctionConfiguration
+                Resource:
+                  - !Sub "arn:aws:lambda:*:${AWS::AccountId}:function:waf-firehose-transformation-lambda"
+          PolicyName: lambda-inline
+
+            
+  FireHoseTransformationLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Used to subscribe accounts in the org to shield advanced and provision resource protections
+      Environment:
+        Variables:
+          SLACK_USERNAME: waf-firehose-transformation-lambda
+          SLACK_CHANNEL: !Ref SlackChannel
+          SLACK_NOTIFICATIONS_SQS_QUEUE: !Ref SlackNotificationsSQSQueue
+          ACCOUNTID: !Ref "AWS::AccountId"
+      FunctionName: waf-firehose-transformation-lambda
+      Handler: index.lambda_handler
+      MemorySize: 600
+      Role:
+        Fn::GetAtt: FireHoseTransformationRole.Arn
+      Runtime: python3.7
+      Timeout: 360
+      Code:
+        ZipFile: |
+          import base64,boto3,json,os,logging
+
+          ssm = boto3.client('ssm')
+          logging.basicConfig(format='%(asctime)s - %(message)s', datefmt='%d-%b-%y %H:%M:%S')
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def sqs_push(slack_message):
+            sqs = boto3.client('sqs', endpoint_url=os.environ['SLACK_NOTIFICATIONS_SQS_QUEUE'])
+            sqs.send_message(
+                QueueUrl=os.environ['SLACK_NOTIFICATIONS_SQS_QUEUE'],
+                MessageBody=json.dumps(slack_message))
+          def slack_message(message):
+            AccountID = os.environ['ACCOUNTID']
+            txt_msg = "Exception encountered during WAF logs transformation for following recordIDs in AWS account *"+ AccountID+"*"
+            slack_message = {
+                    "Username": "WAF-FireHoseTransformationLambda",
+                    "Channel": os.environ['SLACK_CHANNEL'],
+                    "blocks": [
+                      {
+                        "type": "section",
+                        "text": {
+                          "type": "mrkdwn",
+                          "text": txt_msg
+                        }
+                      },
+                      {
+                        "type": "divider"
+                      },
+                      {
+                        "type": "section",
+                        "text": {
+                          "type": "mrkdwn",
+                          "text": message
+                        }
+                      }
+                    ]
+                }
+            sqs_push(slack_message)
+          def transform(payload):
+            dict = {}
+            try:
+                dict['timestamp'] = payload['timestamp']
+                dict['formatVersion'] = payload['formatVersion']
+                dict['webaclId'] = payload['webaclId']
+                dict['terminatingRuleId'] = payload['terminatingRuleId']
+                dict['terminatingRuleType'] = payload['terminatingRuleType']
+                dict['action'] = payload['action']
+                dict['terminatingRuleMatchDetails'] = payload['terminatingRuleMatchDetails']
+                dict['httpSourceName'] = payload['httpSourceName']
+                dict['httpSourceId'] = payload['httpSourceId']
+                dict['ruleGroupList'] = payload['ruleGroupList']
+                dict['rateBasedRuleList'] = payload['rateBasedRuleList']
+                dict['nonTerminatingMatchingRules'] = payload['nonTerminatingMatchingRules']
+                dict['httpRequestclientIp'] = payload['httpRequest']['clientIp']
+                dict['httpRequestcountry'] = payload['httpRequest']['country']
+                dict['httpRequesturi'] = payload['httpRequest']['uri']
+                dict['httpRequestargs'] = payload['httpRequest']['args']
+                dict['httpRequesthttpVersion'] = payload['httpRequest']['httpVersion']
+                dict['httpRequesthttpMethod'] = payload['httpRequest']['httpMethod']
+                dict['httpRequestrequestId'] = payload['httpRequest']['requestId']
+                for header in payload['httpRequest']['headers']:
+                    json_field = 'httpRequest'+header['name']
+                    # print(json_field)
+                    dict[json_field] = header['value']
+                logging.info(f'Transformation successfull')
+                return dict
+            except Exception as e:
+                print(e)
+                logger.error("Transformation failed: %s", e)           
+                
+          def lambda_handler(event, context):
+            output = []
+            processed_rec = 0
+            total_rec = len(event['records'])
+            message = ''
+            for record in event['records']:
+              payload = base64.b64decode(record['data'])
+              payload = json.loads(payload)
+              dict = transform(payload)
+              if (dict):
+                processed_rec += 1
+                output_record = {
+                      'recordId': record['recordId'],
+                      'result': 'Ok',
+                      'data': base64.b64encode(json.dumps(dict).encode('utf-8')).decode('utf-8')
+                  }
+                output.append(output_record)
+                # logging.info(f'Successfully processed - {} records')
+                print(f'Successfully processed {processed_rec} of {total_rec} records.')
+                # print(output)
+              else:
+                message = message + "`" + record['recordId'] + "`\n"
+                print(f'Failed recordsIds: {message}')
+            if len(message) > 0:
+              slack_message(message)
+            if (processed_rec):
+              return {'records': output}
+
+  FirehoseDeliveryStream:
+    Properties:
+      DeliveryStreamEncryptionConfigurationInput:
+        KeyType: AWS_OWNED_CMK
+      DeliveryStreamName: aws-waf-logs-central
+      DeliveryStreamType: DirectPut
+      ExtendedS3DestinationConfiguration:
+        ProcessingConfiguration:
+          Enabled: True
+          Processors:
+            - Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !GetAtt FireHoseTransformationLambdaFunction.Arn
+                - ParameterName: NumberOfRetries
+                  ParameterValue: 0
+                - ParameterName: RoleArn
+                  ParameterValue: !GetAtt FireHoseTransformationRole.Arn
+                - ParameterName: BufferIntervalInSeconds
+                  ParameterValue: 60
+                - ParameterName: BufferSizeInMBs
+                  ParameterValue: 1
+              Type: Lambda
+        BucketARN: arn:aws:s3:::central-waf-logging
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 5
+        CloudWatchLoggingOptions:
+          Enabled: True
+          LogGroupName: !Ref FirehoseLogGroup
+          LogStreamName: !Ref FirehoseLogStream
+        ErrorOutputPrefix: !Sub 'error2/${AWS::AccountId}/${AWS::Region}/!{firehose:error-output-type}/!{timestamp:yyyy/MM/dd}/'
+        Prefix: !Sub 'data2/${AWS::AccountId}/${AWS::Region}/!{timestamp:yyyy/MM/dd/HH}/'
+        RoleARN: !Sub "arn:aws:iam::${AWS::AccountId}:role/${FirehoseIAMRoleName}"
+    Type: AWS::KinesisFirehose::DeliveryStream
+
+  FirehoseLogGroup:
+    Properties:
+      LogGroupName: !Ref LogGroup
+      RetentionInDays: 90
+    Type: AWS::Logs::LogGroup
+  FirehoseLogStream:
+    Properties:
+      LogGroupName: !Ref FirehoseLogGroup
+      LogStreamName: !Ref LogStream
+    Type: AWS::Logs::LogStream

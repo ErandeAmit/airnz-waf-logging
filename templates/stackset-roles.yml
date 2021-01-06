@@ -1,0 +1,62 @@
+Description: Resources for Kinesis Firehose delivery stream for central WAF logging - Managed by the AWS Platform team - IAM Roles
+Parameters:
+  LogGroup:
+    Type: String
+    Default: aws-waf-logs-central
+  LogStream:
+    Type: String
+    Default: Error
+  FirehoseIAMRoleName:
+    Type: String
+Resources:
+  DRTAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service: drt.shield.amazonaws.com
+        Version: '2012-10-17'
+      Description: Assumed by the AWS DDoS Response Team to be able to view and make changes to WebACLs in response to DDoS events
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSShieldDRTAccessPolicy
+      RoleName: AWSShieldDRTAccessRole
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - firehose.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Description: Assumed by the Kinesis Firehose delivery stream for central WAF logging
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource:
+                  - arn:aws:s3:::central-waf-logging
+                  - arn:aws:s3:::central-waf-logging/*
+          PolicyName: s3-inline
+        - PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:aws:logs:*:${AWS::AccountId}:log-group:${LogGroup}:log-stream:*"
+          PolicyName: logs-inline
+      RoleName: !Ref FirehoseIAMRoleName
